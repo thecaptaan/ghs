@@ -107,4 +107,6 @@ Then paste the token when `ghs add ...` asks for it.
 
 ## License
 
-Include your preferred license here, for example MIT.
+This project is released under the MIT License.
+
+The MIT License is required for this repository and allows reuse with minimal restrictions.
