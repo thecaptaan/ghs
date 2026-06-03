@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/git-gh-switch"
+PROFILE_FILE="${CONFIG_DIR}/profiles.db"
+
+mkdir -p "$CONFIG_DIR"
+touch "$PROFILE_FILE"
+chmod 700 "$CONFIG_DIR"
+chmod 600 "$PROFILE_FILE"
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ghs add <profile> <git_name> <git_email> <gh_username>
+  ghs switch <profile>
+  ghs current
+  ghs list
+  ghs remove <profile>
+  ghs logout
+  ghs help
+
+Examples:
+  ghs add personal "Dev Kumar" dev@example.com devkumar
+  ghs add work "Dev Work" dev@company.com devwork
+  ghs switch personal
+  ghs current
+EOF
+}
+
+profile_exists() {
+  local profile="$1"
+  grep -qE "^${profile}\|" "$PROFILE_FILE"
+}
+
+get_profile_line() {
+  local profile="$1"
+  grep -E "^${profile}\|" "$PROFILE_FILE" | head -n 1 || true
+}
+
+save_profile() {
+  local profile="$1" git_name="$2" git_email="$3" gh_user="$4" token="$5"
+
+  if profile_exists "$profile"; then
+    die "Profile '$profile' already exists. Remove it first or choose another name."
+  fi
+
+  printf '%s|%s|%s|%s|%s\n' "$profile" "$git_name" "$git_email" "$gh_user" "$token" >> "$PROFILE_FILE"
+}
+
+update_git_config() {
+  local git_name="$1" git_email="$2"
+  git config --global user.name "$git_name"
+  git config --global user.email "$git_email"
+}
+
+switch_gh_user() {
+  local gh_user="$1" token="$2"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    die "'gh' CLI is not installed."
+  fi
+
+  # Ensure any existing GitHub login is cleared before switching accounts.
+  gh auth logout --hostname github.com -y >/dev/null 2>&1 || true
+
+  # Login using the stored token
+  printf '%s' "$token" | gh auth login --with-token --hostname github.com >/dev/null
+
+  # Keep git credential helper in sync with gh
+  gh auth setup-git >/dev/null 2>&1 || true
+}
+
+show_current() {
+  echo "=== Git identity ==="
+
+  local local_name local_email global_name global_email
+  local_name="$(git config --local user.name 2>/dev/null || true)"
+  local_email="$(git config --local user.email 2>/dev/null || true)"
+  global_name="$(git config --global user.name 2>/dev/null || true)"
+  global_email="$(git config --global user.email 2>/dev/null || true)"
+
+  if [[ -n "${local_name}" || -n "${local_email}" ]]; then
+    echo "Repo config : ${local_name:-<unset>} <${local_email:-unset}>"
+  else
+    echo "Repo config : <not set in this repo>"
+  fi
+
+  echo "Global config: ${global_name:-<unset>} <${global_email:-unset}>"
+
+  echo
+  echo "=== gh identity ==="
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      local gh_login
+      gh_login="$(gh api user --jq .login 2>/dev/null || true)"
+      if [[ -n "$gh_login" ]]; then
+        echo "Logged in   : $gh_login"
+      else
+        echo "Logged in   : yes (username not detected)"
+      fi
+    else
+      echo "Logged in   : no"
+    fi
+  else
+    echo "gh CLI      : not installed"
+  fi
+}
+
+list_profiles() {
+  if [[ ! -s "$PROFILE_FILE" ]]; then
+    echo "No profiles saved."
+    exit 0
+  fi
+
+  printf "%-16s %-22s %-28s %-18s\n" "PROFILE" "GIT NAME" "GIT EMAIL" "GH USER"
+  printf "%-16s %-22s %-28s %-18s\n" "-------" "--------" "--------- " "-------"
+
+  while IFS='|' read -r profile git_name git_email gh_user token; do
+    [[ -z "${profile:-}" ]] && continue
+    printf "%-16s %-22s %-28s %-18s\n" "$profile" "$git_name" "$git_email" "$gh_user"
+  done < "$PROFILE_FILE"
+}
+
+remove_profile() {
+  local profile="$1"
+  profile_exists "$profile" || die "Profile '$profile' not found."
+
+  tmpfile="$(mktemp)"
+  grep -vE "^${profile}\|" "$PROFILE_FILE" > "$tmpfile" || true
+  mv "$tmpfile" "$PROFILE_FILE"
+  chmod 600 "$PROFILE_FILE"
+  echo "Removed profile '$profile'."
+}
+
+switch_profile() {
+  local profile="$1"
+  profile_exists "$profile" || die "Profile '$profile' not found."
+
+  local line git_name git_email gh_user token
+  line="$(get_profile_line "$profile")"
+  IFS='|' read -r _ git_name git_email gh_user token <<< "$line"
+
+  [[ -n "${git_name:-}" ]] || die "Invalid profile data for '$profile'."
+
+  update_git_config "$git_name" "$git_email"
+  switch_gh_user "$gh_user" "$token"
+
+  echo "Switched to '$profile'"
+  echo "Git : $git_name <$git_email>"
+  echo "gh  : $gh_user"
+}
+
+logout_gh() {
+  if command -v gh >/dev/null 2>&1; then
+    gh auth logout --hostname github.com -y >/dev/null 2>&1 || gh auth logout -y >/dev/null 2>&1 || true
+    echo "Logged out from gh."
+  else
+    echo "gh CLI is not installed."
+  fi
+}
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  add)
+    [[ $# -ge 5 ]] || die "Usage: $0 add <profile> <git_name> <git_email> <gh_username>"
+    profile="$2"
+    git_name="$3"
+    git_email="$4"
+    gh_user="$5"
+
+    echo "Enter GitHub token for '$gh_user' (input hidden):"
+    read -rs token
+    echo
+
+    [[ -n "$token" ]] || die "Token cannot be empty."
+
+    save_profile "$profile" "$git_name" "$git_email" "$gh_user" "$token"
+    echo "Saved profile '$profile'."
+    ;;
+  switch)
+    [[ $# -ge 2 ]] || die "Usage: $0 switch <profile>"
+    switch_profile "$2"
+    ;;
+  current)
+    show_current
+    ;;
+  list)
+    list_profiles
+    ;;
+  remove)
+    [[ $# -ge 2 ]] || die "Usage: $0 remove <profile>"
+    remove_profile "$2"
+    ;;
+  logout)
+    logout_gh
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
